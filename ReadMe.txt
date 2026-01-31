@@ -1,21 +1,19 @@
-SENTINEL - Multimodal Biometric Verification System
-Students: Muhammad Imad Aziz Khan, Airad Khan, Jassahib Singh
-Course: Biometric Systems (Sapienza University of Rome)
+# SENTINEL: Multimodal Biometric Verification System 🛡️
 
-[ DESCRIPTION ]
-A multimodal biometric system fusing Face Recognition (LBPH) and Keystroke Dynamics (Mahalanobis Distance) with Liveness Detection.
+**Authors:** Muhammad Imad Aziz Khan, Airad Khan, Jassahib Singh  
+**Course:** Biometric Systems, Sapienza University of Rome
 
-[ INSTALLATION ]
-1. Install Python 3.x
-2. Install dependencies: pip install -r requirements.txt
+## 📜 Overview
+Sentinel is a dual-trait authentication system fusing **Face Recognition (LBPH)** and **Keystroke Dynamics (Mahalanobis Distance)**. It features active Liveness Detection to prevent spoofing.
 
-[ HOW TO RUN ]
-1. Run 'Final_Sentinel.py'
-2. Click 'Live System' for the main demo.
-3. Click 'Simulation' to test the Biometric Menagerie (Sheep/Goats/Wolves).
-4. Default Admin Password: admin
+## 🚀 Features
+- **1:1 Verification:** Secure ID matching.
+- **Liveness Detection:** Challenge-response ("Move Closer") to block 2D photo attacks.
+- **Adaptive Fusion:** Weighted score logic based on image quality.
+- **Admin Panel:** Real-time DET Curve generation and intruder monitoring.
 
-[ FOLDER STRUCTURE ]
-- dataset/      : Contains pre-enrolled user profiles for simulation.
-- models/       : Contains trained LBPH models and statistical profiles.
-- intruders/    : Stores captured images of failed login attempts.
+## 🛠️ Installation
+1. Install Python 3.8+
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
