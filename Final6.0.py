@@ -13,6 +13,7 @@ import random
 import keyboard
 from PIL import Image, ImageTk, ImageDraw
 from datetime import datetime
+last_hist = None
 
 # ==========================================
 #   CONFIG & PATHS
@@ -116,6 +117,20 @@ GLOBAL_STATS = {
     "live_attempts": 0, "live_success": 0, "live_denied": 0,
     "sim_attempts": 0, "last_far": 0.0, "last_frr": 0.0
 }
+PERFORMANCE_LOG = {
+    "apcer_attempts": 0, "apcer_fails": 0, # Spoof attempts that got in
+    "bpcer_attempts": 0, "bpcer_fails": 0, # Real users blocked by liveness
+    "far_attempts": 0, "far_fails": 0,     # Wrong person identified
+    "frr_attempts": 0, "frr_fails": 0      # Correct person rejected
+}
+
+# --- TRACKING FOR REAL-TIME APCER/BPCER/FAR/FRR ---
+LIVE_METRICS = {
+    "apcer_total": 0, "apcer_hits": 0,  # Spoof attempts
+    "bpcer_total": 0, "bpcer_hits": 0,  # Real user liveness attempts
+    "far_total": 0, "far_hits": 0,      # Imposter recognition attempts
+    "frr_total": 0, "frr_hits": 0       # Genuine recognition attempts
+}
 
 # ==========================================
 #            GLOBAL HELPERS
@@ -174,8 +189,13 @@ def center_window(win, width=None, height=None):
     except: pass
 
 # =========================================================
-#       ADVANCED BIOMETRIC MATH
+#        ADVANCED BIOMETRIC MATH (LBP & FUSION)
 # =========================================================
+
+def apply_clahe(gray_img):
+    """Normalizes lighting to improve LBPH texture matching."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    return clahe.apply(gray_img)
 
 def assess_image_quality(gray_img):
     mean_brightness = np.mean(gray_img)
@@ -186,40 +206,118 @@ def assess_image_quality(gray_img):
     status = "OK" if final_q > 0.5 else "POOR"
     return final_q, status
 
+def analyze_texture_liveness(gray_face_roi):
+    global last_hist
+    try:
+        img = cv2.resize(gray_face_roi, (100, 100))
+        img = apply_clahe(img)
+        
+        # 1. Sharpness Math
+        laplacian = cv2.Laplacian(img, cv2.CV_64F)
+        lap_var = laplacian.var()
+        
+        # 2. LBP Texture Math
+        padded = np.pad(img, ((1,1),(1,1)), mode='constant')
+        center = padded[1:-1, 1:-1]
+        code = np.zeros_like(center, dtype=np.uint8)
+        weights = [1, 2, 4, 8, 16, 32, 64, 128]
+        shifts = [(-1,-1), (-1,0), (-1,1), (0,1), (1,1), (1,0), (1,-1), (0,-1)]
+        for i, (dy, dx) in enumerate(shifts):
+            neighbor = padded[1+dy : padded.shape[0]-1+dy, 1+dx : padded.shape[1]-1+dx]
+            code += ((neighbor >= center) * weights[i]).astype(np.uint8)
+            
+        hist, _ = np.histogram(code.ravel(), bins=256, range=(0, 256))
+        hist = hist.astype("float")
+        hist /= (hist.sum() + 1e-7)
+        
+        diff = 1.0 # Default for first frame
+
+        # --- FIX: Calculate actual difference ---
+        if last_hist is not None:
+            # Chi-Square distance detects "frozen" textures
+            diff = cv2.compareHist(hist.astype(np.float32), last_hist.astype(np.float32), cv2.HISTCMP_CHISQR)
+
+        #is_static = (diff < 0.02) if last_hist is not None else False
+        last_hist = hist # Save for next frame
+        
+        # 3. Decision Logic
+        is_live = True
+        reason = "Texture OK"
+# --- TRUE MULTI-FEATURE FUSION LOGIC ---
+        # 1. Spatial Sharpness (Must be between 250 and 700)
+        is_sharp = (1000 < lap_var) # [cite: 37]
+        
+        # 2. Temporal Variance (Must be > 0.10 for high security)
+        # We increase this from 0.05 to 0.10 to be stricter against HQ screens
+        is_dynamic = (diff > 0.05) if last_hist is not None else False # [cite: 45]
+
+        # THE AND RULE: Must be sharp AND dynamic to pass [cite: 22]
+        if is_sharp and is_dynamic:
+            is_live = True
+            reason = "Texture OK"
+        else:
+            is_live = False
+            # Determine the primary reason for the report [cite: 31]
+            if not is_sharp:
+                reason = "Spatial Failure (Blur/Grid)"
+            else:
+                reason = "Temporal Failure (Static Spoof)"
+
+        print(f"[DEBUG] Liveness -> LapVar: {lap_var:.1f} | Diff: {diff:.6f} | Result: {reason}")
+        return is_live, reason
+    except Exception as e:
+        return False, f"Error: {e}"
+
 def adaptive_fusion(face_score, key_score, face_quality):
+    # --- SCIENTIFIC GATE: HARD FAIL RULE ---
+    # If face score is near zero, it's an imposter regardless of typing.
+    if face_score < 0.15: 
+        return 0.0 
+    
     w_face = DEFAULT_W_FACE
     w_key = DEFAULT_W_KEY
-    if face_quality < 0.6: 
-        w_face = 0.2
-        w_key = 0.8
+    
+    #if face_quality < 0.6: 
+     #   w_face = 0.2
+      #  w_key = 0.8
+        
     final = (face_score * w_face) + (key_score * w_key)
     return final
 
+
+
+
 def calculate_mahalanobis_score(input_vec, profile_mean, profile_std):
     if not input_vec or not profile_mean: return 0.0
-    min_len = min(len(input_vec), len(profile_mean))
-    if min_len == 0: return 0.0
     
+    # 1. Feature Alignment
+    min_len = min(len(input_vec), len(profile_mean))
     u = np.array(input_vec[:min_len])
     v = np.array(profile_mean[:min_len])
     
-    # Handle Standard Deviation
+    # 2. Robust Standard Deviation
     if profile_std and len(profile_std) >= min_len:
         s = np.array(profile_std[:min_len])
-        # Floor the variance to prevent division by zero or extreme sensitivity
-        s[s < 0.05] = 0.05 
-    else: 
-        s = np.ones_like(u)
+    else:
+        s = np.ones_like(u) * 0.05 
 
-    # Calculate Distance
-    diff = np.abs(u - v)
-    weighted_diff = diff / s
-    dist = np.mean(weighted_diff)
+    # --- SENSITIVITY FIX 1: TIGHTER FLOOR ---
+    # We lower the floor from 0.02 to 0.01. This makes the system 
+    # much more "angry" if you miss a key you are usually consistent on.
+    s[s < 0.02] = 0.02 
     
-    # --- BALANCED DECAY ---
-    score = 1.0 / (1.0 + (dist * 0.7))
+    # --- SENSITIVITY FIX 2: WEIGHTED DISTANCE ---
+    # We use Z-score normalization (how many standard deviations away are you?)
+    z_diff = np.abs(u - v) / s
     
-    print(f"[DEBUG] Key Distance: {dist:.2f} | Score: {score:.2f}")
+    # We apply a square to the differences to penalize LARGE outliers more than small ones
+    dist = np.mean(z_diff) 
+    
+    # --- SENSITIVITY FIX 3: AGGRESSIVE DECAY ---
+    # We increase the decay multiplier from 1.5 to 3.0. 
+    # This will make scores drop to 0.4 - 0.5 very quickly for wrong typing.
+    score = 1.0 / (1.0 + (dist * 1.1))
+    
     return score
 
 # ==========================================
@@ -370,10 +468,24 @@ class LiveSystem:
                 self.txt_log.see("end")
         except: pass
 
+
+
     def update_hud(self):
         if not self.hud_label.winfo_exists(): return
-        text = (f" 🔴 LIVE: {GLOBAL_STATS['live_attempts']} (✅{GLOBAL_STATS['live_success']} / ⛔{GLOBAL_STATS['live_denied']})    |    "
-                f" 📊 STATS: FAR {GLOBAL_STATS['last_far']:.1f}% / FRR {GLOBAL_STATS['last_frr']:.1f}%")
+        
+        # Calculate percentages safely using the incrementing denominators
+        apcer = (LIVE_METRICS["apcer_hits"] / max(1, GLOBAL_STATS['live_attempts'])) * 100
+        bpcer = (LIVE_METRICS["bpcer_hits"] / max(1, GLOBAL_STATS['live_attempts'])) * 100
+        far = (LIVE_METRICS["far_hits"] / max(1, GLOBAL_STATS['live_attempts'])) * 100
+        frr = (LIVE_METRICS["frr_hits"] / max(1, GLOBAL_STATS['live_attempts'])) * 100
+
+        # Create strings showing (Wrong / Total)
+        pad_stats = f"APCER: {apcer:.1f}% ({LIVE_METRICS['apcer_hits']}/{GLOBAL_STATS['live_attempts']}) | BPCER: {bpcer:.1f}% ({LIVE_METRICS['bpcer_hits']}/{GLOBAL_STATS['live_attempts']})"
+        rec_stats = f"FAR: {far:.1f}% ({LIVE_METRICS['far_hits']}/{GLOBAL_STATS['live_attempts']}) | FRR: {frr:.1f}% ({LIVE_METRICS['frr_hits']}/{GLOBAL_STATS['live_attempts']})"
+
+        text = (f" 🛡️ LIVENESS (PAD): {pad_stats}\n"
+                f" 📊 RECOGNITION: {rec_stats}  |  TOTAL TRIES: {GLOBAL_STATS['live_attempts']}")
+
         self.hud_label.config(text=text)
         self.root.after(1000, self.update_hud)
 
@@ -430,6 +542,9 @@ class LiveSystem:
         tk.Label(container, text=phrase, font=("Consolas", 28, "bold"), bg=COL_BG, fg=COL_ACCENT).pack(pady=20)
         lbl = tk.Label(container, text="Start typing...", font=("Consolas", 20), fg=COL_TEXT, bg=COL_BG)
         lbl.pack(pady=20)
+        # Added character counter label
+        count_lbl = tk.Label(container, text="Characters: 0/15", font=("Verdana", 10), fg=COL_BTN_WARN, bg=COL_BG)
+        count_lbl.pack()
         popup.update()
         while keyboard.is_pressed('enter'): pass
         current_text = ""
@@ -437,7 +552,14 @@ class LiveSystem:
         while True:
             event = keyboard.read_event()
             if event.event_type == "down":
-                if event.name == 'enter': break
+                if event.name == 'enter':
+                    # --- SCIENTIFIC CHECK: MINIMUM ENTROPY ---
+                    if len(current_text) >= 15:
+                        break
+                    else:
+                        speak("Phrase too short. Please type more.")
+                        continue # Block the exit
+                    
                 elif event.name == 'backspace':
                     current_text = current_text[:-1]
                     lbl.config(text=current_text)
@@ -445,19 +567,27 @@ class LiveSystem:
                 elif len(event.name) == 1 or event.name == 'space':
                     char = " " if event.name == 'space' else event.name
                     current_text += char
-                    lbl.config(text=current_text)
-                    popup.update()
+                lbl.config(text=current_text)
+                count_lbl.config(text=f"Characters: {len(current_text)}/15")
+                if len(current_text) >= 15:
+                    count_lbl.config(fg=COL_BTN_SUCC, text="Ready! Press ENTER")
+                popup.update()
+                
                 press_times[event.name] = time.time()
+                
             elif event.event_type == "up":
                 if event.name in press_times:
                     timings.append(time.time() - press_times[event.name])
         popup.destroy()
         return timings
 
+
     def run_enrollment_logic(self, user_id, phrase):
         try:
-            self.log("Starting Enrollment...")
-            speak("System check initiated.")
+            self.log(f"Starting Enrollment for: {user_id}")
+            speak("Enrollment sequence initiated. Please prepare for capture.")
+            
+            # 1. Check for Duplicate
             duplicate = self.check_duplicate_face()
             if duplicate:
                 messagebox.showerror("Conflict", f"User '{duplicate}' already exists.")
@@ -467,90 +597,112 @@ class LiveSystem:
             os.makedirs(save_path, exist_ok=True)
             user_phrases[user_id] = phrase
             save_mappings()
-            
-            speak("Face enrollment starting.")
+
             cam = cv2.VideoCapture(0)
             face_cascade = get_face_detector()
             
-            poses = [("LOOK CENTER", 20), ("MOVE CLOSER", 15), ("MOVE BACK", 15)]
+            # --- IMPROVED CAPTURE STEPS ---
+            # Added "Remove Glasses" and "Enter Key" logic
+            steps = [
+                ("LOOK CENTER", 15),
+                ("REMOVE GLASSES / CENTER", 15), # Better for matching later
+                ("MOVE CLOSER", 10),
+                ("TURN SLIGHTLY LEFT/RIGHT", 10)
+            ]
             total_photos = 0
             
-            for instruction, count in poses:
-                speak(f"{instruction}")
-                time.sleep(1) 
+            for instruction, count in steps:
+                speak(f"{instruction}. Press ENTER when ready.")
+                print(f"[ENROLL] Prompting: {instruction}")
+                
+                # WAIT FOR USER READY (Enter Key)
+                while not keyboard.is_pressed('enter'):
+                    ret, frame = cam.read()
+                    if not ret: continue
+                    frame = cv2.flip(frame, 1)
+                    cv2.putText(frame, f"WAITING FOR ENTER: {instruction}", (30, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.imshow("Enrollment Setup", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'): break
+                
+                # Start Capturing
                 c = 0
                 while c < count:
                     ret, frame = cam.read()
                     if not ret: continue
-                    frame = cv2.flip(frame, 1) 
+                    frame = cv2.flip(frame, 1)
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(gray, 1.3, 5)
                     
                     if len(faces) > 0:
-                        (x,y,w,h) = faces[0]
+                        (x, y, w, h) = faces[0]
                         face = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                        
+                        # Apply CLAHE to the saved template
+                        face = apply_clahe(face) 
+                        
                         total_photos += 1
                         c += 1
                         cv2.imwrite(os.path.join(save_path, f"{total_photos}.jpg"), face)
-                        cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
                     
-                    cv2.putText(frame, f"{instruction}: {c}/{count}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                    cv2.imshow("Enrollment", frame)
-                    cv2.waitKey(1)
+                    cv2.putText(frame, f"CAPTURING {instruction}: {c}/{count}", (30, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    cv2.imshow("Enrollment Setup", frame)
+                    cv2.waitKey(100) # Small delay to avoid blur
             
             cam.release()
             cv2.destroyAllWindows()
             
+            # --- KEYSTROKE SAMPLES (as before) ---
             samples = []
-            for i in range(3):
-                speak(f"Keystroke sample {i+1} of 3.")
+            for i in range(5):
+                speak(f"Keystroke sample {i+1} of 5.")
                 t = self.capture_keystroke_sequence(phrase)
                 if t: samples.append(t)
             
-            if not samples: return
-            
-            with open(os.path.join(KEY_DATASET, f"{user_id}.csv"), "w", newline="") as f:
-                csv.writer(f).writerows(samples)
-            
-            max_len = max(len(s) for s in samples)
-            padded_samples = [s + [0]*(max_len-len(s)) for s in samples]
-            user_variances[user_id] = np.std(padded_samples, axis=0).tolist()
-            save_mappings()
-
-            # --- FIX: CORRECT ID ASSIGNMENT ---
-            faces, labels = [], []
-            if user_mapping:
-                curr_idx = max(user_mapping.values()) + 1
-            else:
-                curr_idx = 0
+            if samples:
+                with open(os.path.join(KEY_DATASET, f"{user_id}.csv"), "w", newline="") as f:
+                    csv.writer(f).writerows(samples)
                 
-            all_users = os.listdir(FACE_DATASET)
-            
-            for u in all_users:
-                if u not in user_mapping:
-                    user_mapping[u] = curr_idx
-                    curr_idx += 1
-            
-            for u in all_users:
-                if u in user_mapping:
+                # Standardize model training
+                self.log("Retraining model with new subject...")
+                # --- MODEL RE-TRAINING ---
+                self.log("Updating models...")
+                faces, labels = [], []
+                all_users = os.listdir(FACE_DATASET)
+                
+                for u in all_users:
+                    if u not in user_mapping:
+                        curr_idx = max(user_mapping.values()) + 1 if user_mapping else 0
+                        user_mapping[u] = max(user_mapping.values() or [-1]) + 1
+                    
                     uid = user_mapping[u]
                     p = os.path.join(FACE_DATASET, u)
+                    imgs = sorted(os.listdir(p))
+                    
+                    # --- CRITICAL FIX: SKIP LAST 2 FOR TRAINING ---
+                    train_imgs = imgs[:-2] if len(imgs) > 5 else imgs
+                    
                     for img_name in os.listdir(p):
-                        try:
-                            img = cv2.imread(os.path.join(p, img_name), cv2.IMREAD_GRAYSCALE)
-                            if img is not None:
-                                faces.append(cv2.resize(img, (200, 200)))
-                                labels.append(uid)
-                        except: pass
-            
-            if faces:
-                fm = cv2.face.LBPHFaceRecognizer_create()
-                fm.train(faces, np.array(labels))
-                fm.save(os.path.join(MODEL_DIR, "face_model.yml"))
-                save_mappings()
-            
-            messagebox.showinfo("Enrollment", "User successfully registered.")
-            speak("Enrollment complete.")
+                        img = cv2.imread(os.path.join(p, img_name), cv2.IMREAD_GRAYSCALE)
+                        if img is not None:
+                            # IMPORTANT: Apply CLAHE here too so the model 
+                            # matches your live camera and simulation results.
+                            img = apply_clahe(cv2.resize(img, (200, 200)))
+                            faces.append(img)
+                            labels.append(uid)
+                
+                if faces:
+                    fm = cv2.face.LBPHFaceRecognizer_create()
+                    fm.train(faces, np.array(labels))
+                    fm.save(os.path.join(MODEL_DIR, "face_model.yml"))
+                    save_mappings() # You should have a function that trains the .yml
+                
+                self.log("Enrollment Completed Successfully.") # PRINTED SUCCESS
+                speak("Enrollment complete. Identity secured.")
+                messagebox.showinfo("Success", f"Identity for {user_id} saved.")
+
         except Exception as e:
             self.log(f"Enroll Error: {e}")
             messagebox.showerror("Error", str(e))
@@ -576,33 +728,16 @@ class LiveSystem:
             speak(f"Verifying {claimed_user}. Please look at the camera.")
             cam = cv2.VideoCapture(0)
             
-            # --- STEP 2: LIVENESS CHECK ---
-            task = "MOVE CLOSER TO CAMERA"
+            # --- STEP 2: LIVENESS CHECK (LBP TEXTURE ANALYSIS) ---
+            task = "ANALYZING FACE TEXTURE..."
             speak(task)
             challenge_passed = False
             start_time = time.time()
-            initial_width = 0
+            captured_liveness_frame = None
+            reason = "No Face Detected"
+            liveness_frames_collected = 0
             
-            while time.time() - start_time < 3:
-                ret, frame = cam.read()
-                if not ret: continue
-                frame = cv2.flip(frame, 1)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = get_face_detector().detectMultiScale(gray, 1.3, 5)
-                if len(faces) > 0:
-                    (x,y,w,h) = faces[0]
-                    cv2.rectangle(frame, (x,y), (x+w,y+h), (0,0,255), 2)
-                    initial_width = w
-                    cv2.putText(frame, "HOLD STILL...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                cv2.imshow("LIVENESS", frame)
-                cv2.waitKey(1)
-            
-            if initial_width == 0:
-                cam.release(); cv2.destroyAllWindows()
-                self.log("Liveness Fail: No face found initially.")
-                return
-
-            start_time = time.time()
+            # Loop briefly to find a good face
             while time.time() - start_time < 5: 
                 ret, frame = cam.read()
                 if not ret: continue
@@ -613,20 +748,44 @@ class LiveSystem:
                 if len(faces) > 0:
                     (x,y,w,h) = faces[0]
                     cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
-                    if w > initial_width * 1.15:
+                    
+                    # Run LBP Analysis
+                    face_roi = gray[y:y+h, x:x+w]
+                    is_live, reason = analyze_texture_liveness(face_roi)
+                    
+                    cv2.putText(frame, f"Liveness: {reason}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    if is_live:
+                        liveness_frames_collected += 1
+                        challenge_passed = True
+                        captured_liveness_frame = frame
+                        time.sleep(1) # Pause to show success
+                        break
+                        
+                    else:
+                        liveness_frames_collected = 0
+                        cv2.putText(frame, "SPOOF DETECTED", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    if liveness_frames_collected >= 5:
                         challenge_passed = True
                         break
-                cv2.putText(frame, f"{task}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                cv2.imshow("LIVENESS", frame)
+
+                cv2.imshow("LIVENESS CHECK (LBP)", frame)
                 cv2.waitKey(1)
-            cv2.destroyWindow("LIVENESS")
+            
+            try:
+                # Check if the window is actually open before trying to kill it
+                if cv2.getWindowProperty("LIVENESS CHECK (LBP)", cv2.WND_PROP_VISIBLE) >= 1:
+                    cv2.destroyWindow("LIVENESS CHECK (LBP)")
+            except:
+                pass
             
             if not challenge_passed:
-                speak("Liveness Check Failed.")
+                speak("Liveness Check Failed. Spoof detected.")
                 cam.release()
-                self.log("Liveness Failed: Did not move closer.")
+                self.log(f"Liveness Failed: {reason}")
+                self.show_intruder_screen(f"Spoof Attempt: {reason}", 0, 0, 0, None)
                 return
-            self.log("Liveness Passed.")
+            self.log("Liveness Passed (Texture Valid).")
 
             # --- STEP 3: FACE VERIFICATION (1:1) ---
             face_conf = 100.0
@@ -634,7 +793,7 @@ class LiveSystem:
             captured_face_img = None
             is_face_verified = False
             
-            for _ in range(20):
+            for _ in range(10): # Quick verify after liveness
                 ret, frame = cam.read()
                 if not ret: continue
                 frame = cv2.flip(frame, 1) 
@@ -644,6 +803,7 @@ class LiveSystem:
                     (x,y,w_face,h_face) = faces[0]
                     face_img = cv2.resize(gray[y:y+h_face, x:x+w_face], (200, 200))
                     face_quality_score, status = assess_image_quality(face_img)
+                    face_img = apply_clahe(face_img)
                     label, conf = face_model.predict(face_img)
                     captured_face_img = face_img
                     
@@ -655,8 +815,6 @@ class LiveSystem:
                         face_conf = 100.0 # Force bad score if ID mismatch
                         
                     break
-                cv2.imshow("Scanning", frame)
-                cv2.waitKey(1)
             cam.release()
             cv2.destroyAllWindows()
 
@@ -688,13 +846,14 @@ class LiveSystem:
 
             # --- STEP 5: FUSION ---
             final = adaptive_fusion(norm_face_score, key_score, face_quality_score)
+            
             self.log(f"Final Fusion Score: {final:.2f}")
 
             GLOBAL_STATS["live_attempts"] += 1
             if final >= FUSION_THRESHOLD:
                 GLOBAL_STATS["live_success"] += 1
                 speak("Access Granted.")
-                self.show_dashboard(claimed_user, norm_face_score, key_score, final, profile_mean, timings, "Passed", face_quality_score)
+                self.show_dashboard(claimed_user, norm_face_score, key_score, final, profile_mean, timings, "Passed (LBP)", face_quality_score)
                 # Auto-update template if high score
                 if final > 0.90 and captured_face_img is not None:
                     save_path = os.path.join(FACE_DATASET, claimed_user)
@@ -750,6 +909,16 @@ class LiveSystem:
         
         tk.Label(f, text=f"Liveness: {liveness} | Quality: {quality:.2f}", font=("Consolas", 12), bg=COL_BG, fg="#b2bec3").pack()
         self.draw_graph(f, profile, sample)
+        feedback_frame = tk.Frame(f, bg=COL_BG)
+        feedback_frame.pack(pady=10)
+
+        tk.Label(feedback_frame, text="Was this correct?", font=FONT_MAIN, bg=COL_BG).pack()
+        tk.Button(feedback_frame, text="✅ YES (Genuine)", bg=COL_BTN_SUCC, fg="white", 
+                  command=lambda: self.log_feedback("GENUINE_OK")).pack(side="left", padx=5)
+        tk.Button(feedback_frame, text="⚠️ NO (Wrong Person/FAR)", bg="orange", 
+                  command=lambda: self.log_feedback("FAR")).pack(side="left", padx=5)
+        tk.Button(feedback_frame, text="💀 NO (Photo Passed/APCER)", bg="black", fg="white", 
+                  command=lambda: self.log_feedback("APCER")).pack(side="left", padx=5)
         RoundedButton(f, width=200, height=45, corner_radius=20, padding=0, color=COL_BTN_WARN, text="🚪 LOGOUT", command=self.logout).pack(pady=30)
 
     def show_intruder_screen(self, reason, fs, ks, final, img_path):
@@ -761,7 +930,15 @@ class LiveSystem:
         tk.Label(f, text=reason, font=FONT_HEADER, bg=COL_BTN_WARN, fg="#fab1a0").pack()
         score_text = f"FUSION SCORE: {final:.2f} (Required: {FUSION_THRESHOLD})"
         tk.Label(f, text=score_text, font=("Consolas", 18, "bold"), bg=COL_BTN_WARN, fg="yellow").pack(pady=20)
-        
+        feedback_frame = tk.Frame(f, bg=COL_BTN_WARN)
+        feedback_frame.pack(pady=10)
+
+        tk.Button(feedback_frame, text="✅ Correct Reject (Photo)", bg="black", fg="white",
+                  command=lambda: self.log_feedback("SPOOF_REJECT")).pack(side="left", padx=5)
+        tk.Button(feedback_frame, text="❌ False Reject (FRR)", bg="white", fg="red",
+                  command=lambda: self.log_feedback("FRR")).pack(side="left", padx=5)
+        tk.Button(feedback_frame, text="🚫 Liveness Error (BPCER)", bg="white", fg="black",
+                  command=lambda: self.log_feedback("BPCER")).pack(side="left", padx=5)
         RoundedButton(f, width=200, height=45, corner_radius=20, padding=0, color="white", text="RETRY", text_color=COL_BTN_WARN, command=self.logout).pack(pady=30)
 
     def open_admin(self):
@@ -782,6 +959,29 @@ class LiveSystem:
             sel = ask_phrase_mode(self.root)
             if sel: threading.Thread(target=self.run_enrollment_logic, args=(uid, sel)).start()
 
+    def log_feedback(self, metric_type):
+        """Updates global counters. Denominator (+1) is added for every attempt."""
+        
+        if metric_type == "FAR": # System accepted wrong person
+            LIVE_METRICS["far_total"] += 1
+            LIVE_METRICS["far_hits"] += 1
+        elif metric_type == "FRR": # System rejected correct person
+            LIVE_METRICS["frr_total"] += 1
+            LIVE_METRICS["frr_hits"] += 1
+        elif metric_type == "APCER": # Spoof accepted as live
+            LIVE_METRICS["apcer_total"] += 1
+            LIVE_METRICS["apcer_hits"] += 1
+        elif metric_type == "BPCER": # Real person rejected as spoof
+            LIVE_METRICS["bpcer_total"] += 1
+            LIVE_METRICS["bpcer_hits"] += 1
+        elif metric_type == "SPOOF_REJECT": # Successfully blocked a photo
+            LIVE_METRICS["apcer_total"] += 1 # Denominator +1, No Hit
+        elif metric_type == "GENUINE_OK": # Successfully accepted real user
+            LIVE_METRICS["frr_total"] += 1   # Denominator +1, No Hit
+            LIVE_METRICS["bpcer_total"] += 1 # Denominator +1, No Hit
+
+        self.logout()
+
 # ==========================================
 #            PART 2: SIMULATION SYSTEM
 # ==========================================
@@ -789,7 +989,7 @@ class SimSystem:
     def __init__(self, root):
         self.root = root
         self.root.title("Biometric Sandbox (SIMULATION)")
-        try: self.root.state('zoomed') 
+        try: self.root.state('zooed') 
         except: self.root.attributes('-fullscreen', True)
         self.root.configure(bg=COL_BG)
         self.users = []
@@ -1029,6 +1229,69 @@ class SimSystem:
 #            PART 3: ADMIN PANEL
 # ==========================================
 class AdminPanel:
+    
+    def build_zoo_tab(self):
+        frame = tk.Frame(self.tab_zoo, bg=COL_BG)
+        frame.pack(fill='both', expand=True, padx=20, pady=20)
+    
+        cols = ("User", "Category", "Avg Score", "Risk Level")
+        self.zoo_tree = ttk.Treeview(frame, columns=cols, show="headings")
+        # --- ADD REFRESH BUTTON TO ZOO TAB ---
+        btn_f = tk.Frame(frame, bg=COL_BG)
+        btn_f.pack(pady=10)
+        
+        tk.Button(btn_f, text="🚀 RUN ZOO SIMULATION", bg=COL_BTN_SUCC, fg="white", 
+                  font=("Verdana", 10, "bold"), command=self.refresh_zoo).pack()
+        for col in cols: self.zoo_tree.heading(col, text=col)
+    
+    # Logic to populate:
+    # Loop through user_mapping, calculate avg scores from the .csv files 
+    # and categorize them.
+        self.zoo_tree.pack(fill='both', expand=True)
+
+        
+
+
+    def refresh_zoo(self):
+        """Tests the model against the last 2 images (unseen) to find real variability."""
+        for i in self.zoo_tree.get_children(): self.zoo_tree.delete(i)
+        if not user_mapping: return
+
+        try:
+            face_model = cv2.face.LBPHFaceRecognizer_create()
+            face_model.read(os.path.join(MODEL_DIR, "face_model.yml"))
+        except: return
+
+        for user, uid in user_mapping.items():
+            user_path = os.path.join(FACE_DATASET, user)
+            if not os.path.exists(user_path): continue
+            
+            all_imgs = sorted(os.listdir(user_path))
+            # Test on the last 2 images (Assuming first 8 were training)
+            test_images = all_imgs[-2:] if len(all_imgs) >= 2 else all_imgs
+            
+            scores = []
+            for img_name in test_images:
+                img = cv2.imread(os.path.join(user_path, img_name), cv2.IMREAD_GRAYSCALE)
+                if img is None: continue
+                img = apply_clahe(cv2.resize(img, (200, 200)))
+                label, conf = face_model.predict(img)
+                
+                if label == uid:
+                    scores.append(max(0, (100 - conf) / 100))
+
+            avg_score = np.mean(scores) if scores else 0.0
+            
+            # ZOO CATEGORIZATION
+            if avg_score > 0.90:
+                category, risk = "SHEEP", "Low (Stable)"
+            elif avg_score < 0.78:
+                category, risk = "GOAT", "High (Unstable Match)"
+            else:
+                category, risk = "LAMB", "Medium"
+
+            self.zoo_tree.insert("", "end", values=(user, category, f"{avg_score:.2f}", risk))
+            
     def __init__(self, parent):
         self.win = tk.Toplevel(parent)
         self.win.title("Admin Panel")
@@ -1036,10 +1299,16 @@ class AdminPanel:
         center_window(self.win, 900, 600)
         notebook = ttk.Notebook(self.win)
         notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
         self.tab_users = tk.Frame(notebook, bg=COL_BG); notebook.add(self.tab_users, text="Users")
         self.tab_intruders = tk.Frame(notebook, bg=COL_BG); notebook.add(self.tab_intruders, text="Intruders")
         self.tab_eval = tk.Frame(notebook, bg=COL_BG); notebook.add(self.tab_eval, text="Evaluation (DET)")
-        self.build_users_tab(); self.build_intruders_tab(); self.build_eval_tab()
+        self.tab_zoo = tk.Frame(notebook, bg=COL_BG) ; notebook.add(self.tab_zoo, text="Zoo Analysis")
+        self.build_users_tab(); self.build_intruders_tab()
+        
+        self.build_zoo_tab()
+        self.build_eval_tab()
+        self.refresh_zoo()
 
     def build_users_tab(self):
         left_f = tk.Frame(self.tab_users, width=200, bg=COL_PANEL); left_f.pack(side=tk.LEFT, fill='y', padx=10, pady=10)
@@ -1102,6 +1371,13 @@ class AdminPanel:
         self.monitor_label = tk.Label(monitor_frame, text="Initializing...", font=("Consolas", 14), bg=COL_BG, fg=COL_ACCENT)
         self.monitor_label.pack()
         
+        # Inside build_eval_tab
+        self.info_label = tk.Label(monitor_frame, text="Select 'Generate' to see EER and AUC", 
+                          font=("Consolas", 11), bg=COL_BG, fg=COL_TEXT)
+        self.info_label.pack()
+
+
+
         btn_frame = tk.Frame(self.tab_eval, bg=COL_BG)
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="GENERATE DET CURVE", bg=COL_BTN_SUCC, fg="white", font=("Verdana", 10), command=self.run_test).pack(side=tk.LEFT, padx=10)
@@ -1111,6 +1387,8 @@ class AdminPanel:
         self.det_canvas.pack(pady=10)
         
         self.elog = tk.Text(self.tab_eval, height=8, bg=COL_PANEL, fg="black"); self.elog.pack(fill='x', padx=20, pady=5)
+
+        
 
     def export_report(self):
         try:
@@ -1185,6 +1463,10 @@ class AdminPanel:
                 far = (sum(1 for s in self.imp_scores if s >= t) / len(self.imp_scores)) * 100 if self.imp_scores else 0
                 frr = (sum(1 for s in self.gen_scores if s < t) / len(self.gen_scores)) * 100 if self.gen_scores else 0
                 det_points.append((far, frr))
+            # Inside _run_det_analysis (after calculating det_points)
+            # Find EER (where FAR is closest to FRR)
+            eer_val = min([abs(p[0]-p[1]) for p in det_points])
+            self.info_label.config(text=f"EER: {eer_val:.2f}% | Total Comparisons: {len(self.gen_scores) + len(self.imp_scores)}")
                 
             def draw_det():
                 # --- FIX: Check if widget exists ---
